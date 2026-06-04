@@ -26,7 +26,6 @@ jobs:
                   node-version: 24
                   cache: npm
 
-            - run: find dist -type f | sort
             - run: npm ci
             - run: npm run build
             - run: npm run docs:build
@@ -34,6 +33,8 @@ jobs:
             - run: |
                   mkdir -p dist/docs
                   cp -r docs/.vitepress/dist/* dist/docs/
+
+            - run: find dist -type f | sort
 
             - uses: actions/upload-pages-artifact@v3
               with:
