@@ -1,0 +1,202 @@
+html,
+body,
+#root {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+}
+
+:root {
+    --light-bg: white;
+    --light-border: #bbb;
+    --dark-border: #333;
+}
+
+body {
+    background: #1e1e1e;
+    font-family: Arial, sans-serif;
+}
+
+.app {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: #1e1e1e;
+}
+
+.header {
+    padding: 12px 16px;
+    color: white;
+    font-size: 20px;
+    border-bottom: 1px solid var(--dark-border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.theme-toggle {
+    padding: 6px 10px;
+
+    border: 1px solid #666;
+    border-radius: 8px;
+
+    background-color: #2d2d2d;
+    color: white;
+
+    cursor: pointer;
+    font-size: 16px;
+}
+
+.theme-toggle:hover {
+    opacity: 0.9;
+}
+
+.main-content {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.light-mode {
+    background-color: var(--light-bg);
+    color: black;
+}
+
+.light-mode .header {
+    background-color: var(--light-bg);
+    color: black;
+    border-bottom-color: #bbb;
+}
+
+.light-mode .theme-toggle {
+    background-color: var(--light-bg);
+    color: black;
+    border-color: #bbb;
+}
+
+.toolbar {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--dark-border);
+    display: flex;
+    gap: 12px;
+    background: #252526;
+}
+
+.run-button,
+.reset-button {
+    background: #0e639c;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+.light-mode .run-button,
+.light-mode .reset-button {
+    background-color: #117bc1;
+}
+
+.run-button:hover,
+.reset-button:hover {
+    background: #1177bb;
+}
+
+.light-mode .run-button:hover,
+.light-mode .reset-button:hover {
+    background: #1075b8;
+}
+
+/* ============ Editor ============ */
+
+.editor-pane {
+    flex: 1;
+    width: 50%;
+    border-right: 1px solid var(--dark-border);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+.cm-theme {
+    max-height: 100%;
+    border-bottom: 1px solid var(--dark-border);
+}
+
+.light-mode .cm-theme {
+    border-bottom: 1px solid var(--light-border);
+}
+
+.cm-editor {
+    height: 100%;
+}
+
+.cm-editor.cm-focused {
+    outline: none;
+}
+
+.cm-scroller {
+    overflow: auto;
+}
+
+/* Style the scrollbar track and thumb (Webkit Browsers) */
+.cm-scroller::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+}
+.cm-scroller::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 6px;
+}
+
+.light-mode .editor-pane,
+.light-mode .visualization-pane,
+.light-mode .toolbar {
+    background-color: var(--light-bg);
+    color: #111;
+    border-color: #bbb;
+}
+
+/* ============ Visualization Pane ============ */
+
+.visualization-pane {
+    flex: 1;
+    color: white;
+    padding: 16px;
+    overflow-y: auto;
+}
+
+.visualization-error-title {
+    color: #ff6b6b;
+}
+
+.visualization-error-card {
+    margin-bottom: 12px;
+    padding: 12px;
+    border: 1px solid #ff6b6b;
+    background-color: rgba(255, 0, 0, 0.1);
+    color: #ff6b6b;
+    border-radius: 6px;
+}
+
+.visualization-error-location {
+    margin-top: 4px;
+    font-size: 0.9em;
+    opacity: 0.9;
+}
+
+.visualization-stack-frame {
+    margin-bottom: 16px;
+    padding: 12px;
+    border: 1px solid #444;
+    border-radius: 6px;
+}
+
+.visualization-stack-variables {
+    margin-top: 8px;
+}
