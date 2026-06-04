@@ -1,8 +1,8 @@
-import type { Node, Tree } from "web-tree-sitter";
-import { compileProgram } from "./compiler2";
+import { compileProgram } from "./compiler";
 import { parseCode } from "./parser";
 import { prettyPrintTree } from "./util";
 
+/*
 function collectSyntaxErrors(tree: Tree) {
     const cursor = tree.walk();
     const errors = [];
@@ -42,6 +42,7 @@ function collectSyntaxErrors(tree: Tree) {
     }
     return errors;
 }
+*/
 
 export function runCode(code: string) {
     // build AST
@@ -84,7 +85,7 @@ export function runCode(code: string) {
         // };
     }
 
-    const errors = collectSyntaxErrors(tree);
+    // const errors = collectSyntaxErrors(tree);
 
     // if (errors.length > 0) {
     //     return {

@@ -36,23 +36,23 @@ function VisualizationPane({ executionState }: VisualizationPaneProps) {
         <div className="visualization-pane">
             <h2>Program Output</h2>
 
-            <pre>{executionState.output}</pre>
+            {/* <pre>{executionState.output}</pre> */}
 
             <h2>Stack</h2>
-
+            {/* 
             {executionState.stack.map((frame, index) => (
                 <div key={index} className="visualization-stack-frame">
                     <strong>{frame.functionName}</strong>
 
                     <div className="visualization-stack-variables">
-                        {/* {frame.scopes.map((scope, i) => (
+                        {frame.scopes.map((scope, i) => (
                             <div key={i}>
                                 {scope.name} = {variable.value}
                             </div>
-                        ))} */}
+                        ))}
                     </div>
                 </div>
-            ))}
+            ))} */}
         </div>
     );
 }

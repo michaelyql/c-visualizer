@@ -68,7 +68,15 @@ export interface Store {
     next: Address; // bump allocator
 }
 
-interface ExecutionState {}
+export type ExecutionError = {
+    message: string;
+    line: number;
+    column: number;
+};
+
+interface ExecutionState {
+    errors?: ExecutionError[];
+}
 
 export type {
     Address,

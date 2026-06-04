@@ -4,7 +4,6 @@ import { initializeParser } from "./engine/parser";
 import EditorPane from "./components/EditorPane";
 import VisualizationPane from "./components/VisualizationPane";
 
-import { runCode } from "./engine/interpreter";
 import { type ExecutionState } from "./engine/types";
 
 import "./styles.css";
@@ -44,7 +43,7 @@ function App() {
     );
 
     function handleRun() {
-        const result = runCode(code);
+        // const result = runCode(code);
         // setExecutionState(result);
     }
 
