@@ -10,6 +10,8 @@ import "./styles.css";
 
 import type { Snapshot } from "./engine/compiler";
 
+import { VM } from "./engine/vm";
+
 const initialCode = `#include <stdio.h>
 
 int factorial(int n) {
@@ -50,6 +52,8 @@ function App() {
         for (const fn of functions) {
             console.log(fn);
         }
+        const vm = new VM(functions);
+        vm.run(true);
         // const result = runCode(code);
         // setExecutionState(result);
     }

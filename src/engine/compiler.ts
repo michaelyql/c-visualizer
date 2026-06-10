@@ -1310,6 +1310,190 @@ export function convert(value: number | bigint, to: CType): number | bigint {
     }
 }
 
+export interface RtValue {
+    value: number | bigint;
+    type: CType;
+}
+
+const COMPARE = new Set(["==", "!=", "<", ">", "<=", ">="]);
+
+export function binaryOp(op: string, lhs: RtValue, rhs: RtValue): RtValue {
+    const lp = lhs.type.kind === "pointer" || lhs.type.kind === "array";
+    const rp = rhs.type.kind === "pointer" || rhs.type.kind === "array";
+    if (lp || rp) return pointerBinary(op, lhs, rhs, lp, rp);
+
+    if (lhs.type.kind === "float" || rhs.type.kind === "float") {
+        const a = Number(lhs.value),
+            b = Number(rhs.value);
+        if (COMPARE.has(op))
+            return { value: compareOp(op, a, b) ? 1 : 0, type: INT };
+        const dbl =
+            (lhs.type.kind === "float" && lhs.type.bits === 64) ||
+            (rhs.type.kind === "float" && rhs.type.bits === 64);
+        const r = floatArith(op, a, b);
+        return {
+            value: dbl ? r : Math.fround(r),
+            type: { kind: "float", bits: dbl ? 64 : 32 },
+        };
+    }
+
+    // shifts: result has the promoted left type; amount is the right operand
+    if (op === "<<" || op === ">>") {
+        const lt = promoteIntType(lhs.type);
+        const la = toBig(convert(lhs.value, lt));
+        const sa = toBig(rhs.value);
+        return {
+            value: wrapToType(op === "<<" ? la << sa : la >> sa, lt),
+            type: lt,
+        };
+    }
+
+    const common = arithCommon(lhs.type, rhs.type);
+    const a = toBig(convert(lhs.value, common));
+    const b = toBig(convert(rhs.value, common));
+    if (COMPARE.has(op))
+        return { value: compareOp(op, a, b) ? 1 : 0, type: INT };
+    return { value: wrapToType(intArith(op, a, b), common), type: common };
+}
+
+export function unaryOp(op: string, x: RtValue): RtValue {
+    if (op === "!") {
+        const t =
+            x.type.kind === "float"
+                ? Number(x.value) !== 0
+                : toBig(x.value) !== 0n;
+        return { value: t ? 0 : 1, type: INT };
+    }
+    if (x.type.kind === "float") {
+        return {
+            value: op === "-" ? -Number(x.value) : Number(x.value),
+            type: x.type,
+        };
+    }
+    const t = promoteIntType(x.type);
+    const v = toBig(x.value);
+    const r = op === "-" ? -v : op === "~" ? ~v : v;
+    return { value: wrapToType(r, t), type: t };
+}
+
+function pointerBinary(
+    op: string,
+    lhs: RtValue,
+    rhs: RtValue,
+    lp: boolean,
+    rp: boolean
+): RtValue {
+    if (COMPARE.has(op))
+        return {
+            value: compareOp(op, Number(lhs.value), Number(rhs.value)) ? 1 : 0,
+            type: INT,
+        };
+    if (lp && rp) {
+        if (op !== "-") throw new Error(`invalid pointer operator '${op}'`);
+        const size = sizeOf(ptrPointee(lhs.type));
+        const diff = Math.trunc((Number(lhs.value) - Number(rhs.value)) / size);
+        return {
+            value: BigInt(diff),
+            type: { kind: "int", bits: 64, signed: true },
+        };
+    }
+    const ptr = lp ? lhs : rhs;
+    const i = Number(lp ? rhs.value : lhs.value);
+    const elem = ptrPointee(ptr.type);
+    let addr: number;
+    if (op === "+") addr = Number(ptr.value) + i * sizeOf(elem);
+    else if (op === "-" && lp) addr = Number(ptr.value) - i * sizeOf(elem);
+    else throw new Error(`invalid pointer operator '${op}'`);
+    return { value: addr, type: { kind: "pointer", to: elem } };
+}
+
+function ptrPointee(t: CType): CType {
+    if (t.kind === "pointer") return t.to;
+    if (t.kind === "array") return t.of;
+    throw new Error("not a pointer");
+}
+function toBig(v: number | bigint): bigint {
+    return typeof v === "bigint" ? v : BigInt(Math.trunc(v));
+}
+function wrapToType(v: bigint, t: CType): number | bigint {
+    return convert(v, t);
+}
+function intArith(op: string, a: bigint, b: bigint): bigint {
+    switch (op) {
+        case "+":
+            return a + b;
+        case "-":
+            return a - b;
+        case "*":
+            return a * b;
+        case "/":
+            if (b === 0n) throw new Error("division by zero");
+            return a / b;
+        case "%":
+            if (b === 0n) throw new Error("modulo by zero");
+            return a % b;
+        case "&":
+            return a & b;
+        case "|":
+            return a | b;
+        case "^":
+            return a ^ b;
+        default:
+            throw new Error(`unsupported operator '${op}'`);
+    }
+}
+function floatArith(op: string, a: number, b: number): number {
+    switch (op) {
+        case "+":
+            return a + b;
+        case "-":
+            return a - b;
+        case "*":
+            return a * b;
+        case "/":
+            return a / b; // /0 -> Infinity, not a fault
+        default:
+            throw new Error(`unsupported float operator '${op}'`);
+    }
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function compareOp(op: string, a: any, b: any): boolean {
+    switch (op) {
+        case "==":
+            return a === b;
+        case "!=":
+            return a !== b;
+        case "<":
+            return a < b;
+        case ">":
+            return a > b;
+        case "<=":
+            return a <= b;
+        case ">=":
+            return a >= b;
+        default:
+            throw new Error(`unsupported comparison '${op}'`);
+    }
+}
+function promoteIntType(t: CType): CType {
+    if (t.kind === "int") return t.bits < 32 ? INT : t;
+    if (t.kind === "bool" || t.kind === "enum") return INT;
+    throw new Error(`cannot promote ${t.kind}`);
+}
+function arithCommon(a: CType, b: CType): CType {
+    const pa = promoteIntType(a) as Extract<CType, { kind: "int" }>;
+    const pb = promoteIntType(b) as Extract<CType, { kind: "int" }>;
+    const bits = Math.max(pa.bits, pb.bits) as 32 | 64;
+    let signed: boolean;
+    if (pa.signed === pb.signed) signed = pa.signed;
+    else {
+        const uBits = pa.signed ? pb.bits : pa.bits;
+        const sBits = pa.signed ? pa.bits : pb.bits;
+        signed = uBits >= sBits ? false : true;
+    }
+    return { kind: "int", bits, signed };
+}
+
 function toBool(v: number | bigint): boolean {
     return typeof v === "bigint" ? v !== 0n : v !== 0 && !Number.isNaN(v);
 }
