@@ -7,11 +7,8 @@ let oldTree: Tree | null = null;
 
 export async function initializeParser() {
     await Parser.init({
-        locateFile(scriptName: string) {
-            scriptName;
-            // tells the WASM loader where to find web-tree-sitter.wasm
-            return "/c-visualizer/tree-sitter/web-tree-sitter.wasm";
-        },
+        // tells the WASM loader where to find web-tree-sitter.wasm
+        locateFile: () => "/c-visualizer/tree-sitter/web-tree-sitter.wasm",
     });
 
     C = await Language.load("/c-visualizer/tree-sitter/tree-sitter-c.wasm");
@@ -38,7 +35,7 @@ export function editTree(
 ) {
     if (!oldTree) return;
 
-    let e = new Edit({
+    const e = new Edit({
         startIndex: from,
         oldEndIndex: oldTo,
         newEndIndex: newTo,

@@ -46,8 +46,8 @@ function App() {
         const tree = parseCode(code);
         console.log(tree.rootNode.toString());
         console.log(prettyPrintTree(tree.rootNode, { showText: true }));
-        let functions = compileProgram(tree.rootNode);
-        for (let fn of functions) {
+        const functions = compileProgram(tree.rootNode);
+        for (const fn of functions) {
             console.log(fn);
         }
         // const result = runCode(code);

@@ -3,6 +3,8 @@
 // (promotion, conversion, overflow, rounding) live in a separate ops module and
 // hand correctly-typed values to writeScalar.
 
+import { type CType } from "./compiler";
+
 export const LITTLE_ENDIAN = true; // model an x86/ARM little-endian target
 
 // Virtual address layout (1 GiB space, matches the prior design).
@@ -65,7 +67,46 @@ interface Region {
     initMask: Uint8Array; // 1 bit per backed byte; 1 = written at least once
 }
 
-function makeRegion(
+export type Status =
+    | { kind: "running" }
+    | { kind: "halted"; exitCode: number }
+    | { kind: "fault"; reason: string; addr?: number };
+
+// Live byte window of one region + its init bits, bounded by the bump pointer
+// so the copy cost is proportional to live size, not the region cap.
+export interface RegionImage {
+    bytes: Uint8Array; // copy of the live range
+    initMask: Uint8Array; // copy of init bits over the same range
+    next: number; // bump pointer (defines the live range when sliced)
+}
+
+export interface MemObject {
+    address: number;
+    type: CType;
+    name?: string; // named variable; absent for heap/anonymous
+    region: RegionId;
+    size: number;
+    lifecycle: "alive" | "freed"; // freed kept (addresses never reused) for UAF
+}
+
+export interface ScopeView {
+    bindings: Map<string, number>;
+} // name -> address
+export interface FrameView {
+    func: string;
+    scopes: ScopeView[];
+} // innermost scope last
+
+export interface Snapshot {
+    regions: Record<RegionId, RegionImage>;
+    objects: Map<number, MemObject>; // keyed by address; grows monotonically
+    frames: FrameView[]; // call stack, index 0 = main
+    highlight: { startByte: number; endByte: number } | null; // source span
+    stdout: string; // output accumulated so far
+    status: Status;
+}
+
+export function makeRegion(
     id: RegionId,
     base: number,
     cap: number,

@@ -66,8 +66,8 @@ export function runCode(code: string) {
         })
     );
 
-    let functions = compileProgram(tree.rootNode);
-    for (let fn of functions) {
+    const functions = compileProgram(tree.rootNode);
+    for (const fn of functions) {
         console.log(fn);
     }
 

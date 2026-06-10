@@ -1,13 +1,15 @@
 import type { Node as SyntaxNode } from "web-tree-sitter";
 
-import { type RegionId } from "./memory";
+import type { RegionId, Status } from "./memory";
 
-interface Member {
+// member field of struct/union
+export interface Member {
     name: string;
     type: CType;
+    offset: number; // byte offset within the aggregate, assigned at layout
 }
 
-type CType =
+export type CType =
     | { kind: "void" }
     | { kind: "int"; bits: 8 | 16 | 32 | 64; signed: boolean } // char/short/int/long
     | { kind: "float"; bits: 32 | 64 } // float/double
@@ -15,8 +17,20 @@ type CType =
     | { kind: "pointer"; to: CType }
     | { kind: "array"; of: CType; length: number | null } // null = incomplete: int a[]
     | { kind: "function"; returns: CType; params: CType[]; variadic: boolean }
-    | { kind: "struct"; tag: string | null; members: Member[] | null } // null = forward-declared
-    | { kind: "union"; tag: string | null; members: Member[] | null }
+    | {
+          kind: "struct";
+          tag: string | null;
+          members: Member[] | null;
+          size: number | null;
+          align: number | null;
+      }
+    | {
+          kind: "union";
+          tag: string | null;
+          members: Member[] | null;
+          size: number | null;
+          align: number | null;
+      }
     | {
           kind: "enum";
           tag: string | null;
@@ -29,10 +43,13 @@ const CHAR: CType = { kind: "int", bits: 8, signed: true };
 const INT: CType = { kind: "int", bits: 32, signed: true };
 const F64: CType = { kind: "float", bits: 64 };
 
-type Status =
-    | { kind: "running" }
-    | { kind: "halted"; exitCode: number }
-    | { kind: "fault"; reason: string; addr?: number };
+type AggregateType = Extract<CType, { kind: "struct" | "union" }>;
+
+interface ModuleCtx {
+    typedefs: Map<string, CType>;
+    tags: Map<string, CType>;
+    enumerators: Map<string, { value: number; type: CType }>;
+}
 
 // Live byte window of one region + its init bits, bounded by the bump pointer
 // so the copy cost is proportional to live size, not the region cap.
@@ -129,6 +146,8 @@ class CompileError extends Error {
 
 const UNPATCHED = -1;
 
+const roundUp = (n: number, a: number) => Math.ceil(n / a) * a;
+
 class FunctionCompiler {
     private code: Instr[] = [];
     private scopeDepth = 0; // nested scopes open beyond the frame base (function body = base)
@@ -142,14 +161,21 @@ class FunctionCompiler {
     private synthName: string | null = null; // set for compiler-generated fns (@init)
     private fallback: SyntaxNode | null = null; // span for synthetic instructions
 
-    constructor(fn: SyntaxNode | null) {
+    private ctx: ModuleCtx;
+
+    constructor(fn: SyntaxNode | null, ctx: ModuleCtx) {
         this.fn = fn;
+        this.ctx = ctx;
     }
 
     // A compiler-generated function with no source declarator (e.g. @init for globals).
     // `fallback` supplies a source span for any synthetic instruction (the trailing RET).
-    static synthetic(name: string, fallback: SyntaxNode): FunctionCompiler {
-        const fc = new FunctionCompiler(null);
+    static synthetic(
+        name: string,
+        ctx: ModuleCtx,
+        fallback: SyntaxNode
+    ): FunctionCompiler {
+        const fc = new FunctionCompiler(null, ctx);
         fc.synthName = name;
         fc.fallback = fallback;
         return fc;
@@ -158,7 +184,7 @@ class FunctionCompiler {
     compile(): IRFunction {
         if (!this.fn)
             throw new Error("compile() on a synthetic compiler; use finish()");
-        const base = baseType(this.fn.childForFieldName("type")!);
+        const base = baseType(this.fn.childForFieldName("type")!, this.ctx);
         const fnDecl = this.fn.childForFieldName("declarator")!;
         if (fnDecl.type != "function_declarator")
             throw new CompileError("not a function declarator", this.fn);
@@ -213,7 +239,7 @@ class FunctionCompiler {
         storage: "static" | "automatic",
         skipFunctionDecls: boolean
     ): void {
-        const base = baseType(node.childForFieldName("type")!);
+        const base = baseType(node.childForFieldName("type")!, this.ctx);
         for (const d of node.childrenForFieldName("declarator")) {
             const inner =
                 d.type === "init_declarator"
@@ -275,7 +301,8 @@ class FunctionCompiler {
         if (
             children.length === 1 &&
             only.type === "parameter_declaration" &&
-            baseType(only.childForFieldName("type")!).kind === "void" &&
+            baseType(only.childForFieldName("type")!, this.ctx).kind ===
+                "void" &&
             !only.childForFieldName("declarator") // void param cannot be named
         ) {
             return { params: [], variadic: false };
@@ -308,7 +335,7 @@ class FunctionCompiler {
             // parameter_declaration
             const tNode = c.childForFieldName("type");
             if (!tNode) continue;
-            const t = baseType(tNode);
+            const t = baseType(tNode, this.ctx);
             const d = c.childForFieldName("declarator");
 
             // void is only legal as the sole, unnamed parameter (handled above);
@@ -551,9 +578,16 @@ class FunctionCompiler {
                     },
                     node
                 );
-            case "identifier":
+            case "identifier": {
+                const en = this.ctx.enumerators.get(node.text);
+                if (en)
+                    return void this.emit(
+                        { op: "PUSH_CONST", value: en.value, type: en.type },
+                        node
+                    );
                 this.emit({ op: "LOAD_ADDR", name: node.text }, node);
                 return void this.emit({ op: "LOAD" }, node);
+            }
             case "parenthesized_expression":
                 return this.compileExpr(this.innerExpr(node));
             case "comma_expression":
@@ -605,11 +639,17 @@ class FunctionCompiler {
     // expressions (lvalue / address)
     private compileLValue(node: SyntaxNode): void {
         switch (node.type) {
-            case "identifier":
+            case "identifier": {
+                if (this.ctx.enumerators.has(node.text))
+                    throw new CompileError(
+                        `enum constant '${node.text}' is not an lvalue`,
+                        node
+                    );
                 return void this.emit(
                     { op: "LOAD_ADDR", name: node.text },
                     node
                 );
+            }
             case "parenthesized_expression":
                 return this.compileLValue(this.innerExpr(node));
             case "pointer_expression":
@@ -749,12 +789,16 @@ class FunctionCompiler {
     }
 }
 
-// helpers
+// ------------------------------------------------
+//                  Helpers
+// ------------------------------------------------
+/*
 function findFunctionDeclarator(node: SyntaxNode): SyntaxNode | null {
     if (node.type === "function_declarator") return node;
     const inner = node.childForFieldName("declarator");
     return inner ? findFunctionDeclarator(inner) : null;
 }
+*/
 
 function declaratorName(node: SyntaxNode): string {
     switch (node.type) {
@@ -818,24 +862,207 @@ function applyDeclaratorType(base: CType, node: SyntaxNode): CType {
     }
 }
 
-function baseType(spec: SyntaxNode): CType {
+function registerTypedef(node: SyntaxNode, ctx: ModuleCtx): void {
+    // `typedef <type> <declarators> ;` — the type may itself define a tag inline.
+    const base = baseType(node.childForFieldName("type")!, ctx);
+    for (const d of node.childrenForFieldName("declarator")) {
+        ctx.typedefs.set(declaratorName(d), applyDeclaratorType(base, d));
+    }
+}
+
+function resolveAggregate(spec: SyntaxNode, ctx: ModuleCtx): CType {
+    const kind: "struct" | "union" =
+        spec.type === "union_specifier" ? "union" : "struct";
+    const tag = spec.childForFieldName("name")?.text ?? null;
+    const body = spec.childForFieldName("body"); // field_declaration_list | null
+
+    if (tag) {
+        let canon = ctx.tags.get(tag);
+        if (!canon) {
+            // Intern BEFORE completing so recursive members (struct Node *next)
+            // resolve to this same object.
+            const c: CType = {
+                kind,
+                tag,
+                members: null,
+                size: null,
+                align: null,
+            };
+            canon = c;
+            ctx.tags.set(tag, canon);
+        } else if (canon.kind !== kind) {
+            throw new CompileError(
+                `'${tag}' defined as wrong kind of tag`,
+                spec
+            );
+        }
+        const agg = canon as AggregateType;
+        if (body) {
+            if (agg.members !== null)
+                throw new CompileError(
+                    `redefinition of '${kind} ${tag}'`,
+                    spec
+                );
+            completeAggregate(agg, body, ctx);
+        }
+        return agg; // may still be incomplete (forward reference)
+    }
+
+    // anonymous: cannot be forward-referenced, so build fully inline.
+    if (!body) throw new CompileError(`anonymous ${kind} without a body`, spec);
+    const agg: AggregateType = {
+        kind,
+        tag: null,
+        members: null,
+        size: null,
+        align: null,
+    };
+    completeAggregate(agg, body, ctx);
+    return agg;
+}
+
+function completeAggregate(
+    t: AggregateType,
+    body: SyntaxNode,
+    ctx: ModuleCtx
+): void {
+    // Resolve member types first (this is where recursion through `t` happens).
+    const raw: { name: string; type: CType }[] = [];
+    for (const fd of body.namedChildren) {
+        if (fd.type !== "field_declaration") continue;
+        if (fd.namedChildren.some((c) => c.type === "bitfield_clause"))
+            throw new CompileError("bitfields not yet supported", fd);
+        const base = baseType(fd.childForFieldName("type")!, ctx);
+        const decls = fd.childrenForFieldName("declarator");
+        if (decls.length === 0)
+            throw new CompileError(
+                "anonymous struct/union members not yet supported",
+                fd
+            );
+        for (const d of decls)
+            raw.push({
+                name: declaratorName(d),
+                type: applyDeclaratorType(base, d),
+            });
+    }
+
+    const members: Member[] = [];
+    let maxAlign = 1;
+    if (t.kind === "union") {
+        let size = 0;
+        for (const m of raw) {
+            const a = alignOf(m.type);
+            maxAlign = Math.max(maxAlign, a);
+            size = Math.max(size, sizeOf(m.type));
+            members.push({ ...m, offset: 0 });
+        }
+        t.size = roundUp(size, maxAlign);
+    } else {
+        let offset = 0;
+        for (const m of raw) {
+            const a = alignOf(m.type);
+            offset = roundUp(offset, a);
+            members.push({ ...m, offset });
+            offset += sizeOf(m.type);
+            maxAlign = Math.max(maxAlign, a);
+        }
+        t.size = roundUp(offset, maxAlign);
+    }
+    t.members = members;
+    t.align = maxAlign;
+}
+
+function resolveEnum(spec: SyntaxNode, ctx: ModuleCtx): CType {
+    const tag = spec.childForFieldName("name")?.text ?? null;
+    const body = spec.childForFieldName("body"); // enumerator_list | null
+    const enumType: CType = {
+        kind: "enum",
+        tag,
+        underlying: { kind: "int", bits: 32, signed: true },
+    };
+
+    if (tag) {
+        const existing = ctx.tags.get(tag);
+        if (existing) {
+            if (existing.kind !== "enum")
+                throw new CompileError(
+                    `'${tag}' defined as wrong kind of tag`,
+                    spec
+                );
+            if (!body) return existing;
+            throw new CompileError(`redefinition of 'enum ${tag}'`, spec);
+        }
+        ctx.tags.set(tag, enumType);
+    }
+
+    if (body) {
+        let counter = 0;
+        for (const e of body.namedChildren) {
+            if (e.type !== "enumerator") continue;
+            const valNode = e.childForFieldName("value");
+            if (valNode) counter = evalConstInt(valNode);
+            ctx.enumerators.set(e.childForFieldName("name")!.text, {
+                value: counter,
+                type: enumType,
+            });
+            counter++;
+        }
+    }
+    return enumType;
+}
+
+// Minimal constant evaluator: integer/char literals + unary +/-/~ only.
+// General constant folding is deferred per scope.
+function evalConstInt(node: SyntaxNode): number {
+    switch (node.type) {
+        case "number_literal":
+            return parseNumber(node.text).value;
+        case "char_literal":
+            return charValue(node);
+        case "parenthesized_expression": {
+            const inner = node.namedChildren.find((n) => n.type !== "comment");
+            if (!inner) throw new CompileError("empty parentheses", node);
+            return evalConstInt(inner);
+        }
+        case "unary_expression": {
+            const op = node.childForFieldName("operator")!.text;
+            const v = evalConstInt(node.childForFieldName("argument")!);
+            if (op === "-") return -v;
+            if (op === "+") return v;
+            if (op === "~") return ~v;
+            throw new CompileError(
+                `unsupported constant operator '${op}'`,
+                node
+            );
+        }
+        default:
+            throw new CompileError(
+                "only integer/char literal constants are supported here",
+                node
+            );
+    }
+}
+
+function baseType(spec: SyntaxNode, ctx: ModuleCtx): CType {
     switch (spec.type) {
         case "primitive_type":
             return primitiveToCType(spec.text, spec);
         case "sized_type_specifier":
             return sizedToCType(spec);
-        case "type_identifier":
-            throw new CompileError(
-                `typedef '${spec.text}' needs the typedef table (not yet wired)`,
-                spec
-            );
+        case "type_identifier": {
+            const t = ctx.typedefs.get(spec.text);
+            if (!t)
+                throw new CompileError(
+                    `unknown type name '${spec.text}'`,
+                    spec
+                );
+            return t;
+        }
         case "struct_specifier":
         case "union_specifier":
+            return resolveAggregate(spec, ctx);
         case "enum_specifier":
-            throw new CompileError(
-                `'${spec.type}' needs the tag table for layout (not yet wired)`,
-                spec
-            );
+            return resolveEnum(spec, ctx);
         default:
             throw new CompileError(
                 `unknown type specifier '${spec.type}'`,
@@ -870,7 +1097,7 @@ function primitiveToCType(text: string, node: SyntaxNode): CType {
         case "intptr_t":
             return { kind: "int", bits: 64, signed: true };
     }
-    let m = /^u?int(\d+)_t$/.exec(text);
+    const m = /^u?int(\d+)_t$/.exec(text);
     if (m)
         return {
             kind: "int",
@@ -959,177 +1186,76 @@ function charValue(node: SyntaxNode): number {
     return unescapeC(inner).codePointAt(0) ?? 0;
 }
 
-type NodeType =
-    // Root
-    | "translation_unit"
+export function sizeOf(t: CType): number {
+    switch (t.kind) {
+        case "bool":
+            return 1;
+        case "int":
+        case "float":
+            return t.bits / 8;
+        case "enum":
+            return t.underlying.bits / 8; // 4
+        case "pointer":
+            return 8;
+        case "array":
+            if (t.length === null)
+                throw new Error("sizeOf: incomplete array (no length)");
+            return t.length * sizeOf(t.of);
+        case "struct":
+        case "union":
+            if (t.size === null)
+                throw new Error(
+                    `sizeOf: incomplete ${t.kind} '${t.tag ?? "<anonymous>"}'`
+                );
+            return t.size;
+        case "void":
+            throw new Error("sizeOf(void)");
+        case "function":
+            throw new Error("sizeOf(function)");
+    }
+}
 
-    // Preprocessor
-    | "preproc_include"
-    | "preproc_def"
-    | "preproc_function_def"
-    | "preproc_params"
-    | "preproc_call"
-    | "preproc_if"
-    | "preproc_ifdef"
-    | "preproc_else"
-    | "preproc_elif"
-    | "preproc_elifdef"
-    | "preproc_arg"
-    | "preproc_directive"
-    | "preproc_defined"
-
-    // Definitions & declarations
-    | "function_definition"
-    | "declaration"
-    | "type_definition"
-    | "init_declarator"
-    | "declaration_list"
-    | "linkage_specification"
-    | "parameter_list"
-    | "parameter_declaration"
-    | "variadic_parameter"
-
-    // Declarators
-    | "pointer_declarator"
-    | "function_declarator"
-    | "array_declarator"
-    | "parenthesized_declarator"
-    | "attributed_declarator"
-    | "abstract_pointer_declarator"
-    | "abstract_function_declarator"
-    | "abstract_array_declarator"
-    | "abstract_parenthesized_declarator"
-
-    // Type specifiers & qualifiers
-    | "primitive_type"
-    | "sized_type_specifier"
-    | "type_identifier"
-    | "type_qualifier"
-    | "storage_class_specifier"
-    | "alignas_qualifier"
-    | "type_descriptor"
-    | "macro_type_specifier"
-
-    // Structs / unions / enums
-    | "struct_specifier"
-    | "union_specifier"
-    | "field_declaration_list"
-    | "field_declaration"
-    | "bitfield_clause"
-    | "enum_specifier"
-    | "enumerator_list"
-    | "enumerator"
-
-    // Statements
-    | "compound_statement"
-    | "expression_statement"
-    | "if_statement"
-    | "else_clause"
-    | "switch_statement"
-    | "case_statement"
-    | "while_statement"
-    | "do_statement"
-    | "for_statement"
-    | "return_statement"
-    | "break_statement"
-    | "continue_statement"
-    | "goto_statement"
-    | "labeled_statement"
-    | "attributed_statement"
-
-    // Expressions
-    | "binary_expression"
-    | "unary_expression"
-    | "update_expression"
-    | "assignment_expression"
-    | "conditional_expression"
-    | "comma_expression"
-    | "pointer_expression"
-    | "cast_expression"
-    | "sizeof_expression"
-    | "alignof_expression"
-    | "offsetof_expression"
-    | "generic_expression"
-    | "extension_expression"
-    | "call_expression"
-    | "argument_list"
-    | "subscript_expression"
-    | "field_expression"
-    | "parenthesized_expression"
-    | "compound_literal_expression"
-
-    // Initializers
-    | "initializer_list"
-    | "initializer_pair"
-    | "subscript_designator"
-    | "subscript_range_designator"
-    | "field_designator"
-
-    // Literals & terminals
-    | "identifier"
-    | "field_identifier"
-    | "statement_identifier"
-    | "number_literal"
-    | "char_literal"
-    | "character"
-    | "string_literal"
-    | "string_content"
-    | "concatenated_string"
-    | "escape_sequence"
-    | "system_lib_string"
-    | "true"
-    | "false"
-    | "null"
-
-    /*
-    // GNU asm
-    | "gnu_asm_expression"
-    | "gnu_asm_qualifier"
-    | "gnu_asm_output_operand_list"
-    | "gnu_asm_output_operand"
-    | "gnu_asm_input_operand_list"
-    | "gnu_asm_input_operand"
-    | "gnu_asm_clobber_list"
-    | "gnu_asm_goto_list"
-    */
-
-    /*
-    // MS extensions / SEH
-    | "ms_call_modifier"
-    | "ms_declspec_modifier"
-    | "ms_based_modifier"
-    | "ms_pointer_modifier"
-    | "ms_restrict_modifier"
-    | "ms_unsigned_ptr_modifier"
-    | "ms_signed_ptr_modifier"
-    | "ms_unaligned_ptr_modifier"
-    | "seh_try_statement"
-    | "seh_except_clause"
-    | "seh_finally_clause"
-    | "seh_leave_statement"
-    */
-
-    // Attributes
-    | "attribute_specifier"
-    | "attribute_declaration"
-    | "attribute"
-
-    // Misc
-    | "comment"
-    | "ERROR"
-    | "MISSING";
+export function alignOf(t: CType): number {
+    switch (t.kind) {
+        case "bool":
+            return 1;
+        case "int":
+        case "float":
+            return t.bits / 8;
+        case "enum":
+            return t.underlying.bits / 8;
+        case "pointer":
+            return 8;
+        case "array":
+            return alignOf(t.of);
+        case "struct":
+        case "union":
+            if (t.align === null)
+                throw new Error(
+                    `alignOf: incomplete ${t.kind} '${t.tag ?? "<anonymous>"}'`
+                );
+            return t.align;
+        case "void":
+        case "function":
+            throw new Error(`alignOf(${t.kind})`);
+    }
+}
 
 // usage:
 //   const funcs  = compileProgram(tree.rootNode);
 //   const byName = new Map(funcs.map(f => [f.name, f]));
 //   // runtime runs "@init" (globals) first, then CALLs main.
 export function compileProgram(root: SyntaxNode): IRFunction[] {
+    const ctx: ModuleCtx = {
+        typedefs: new Map(),
+        tags: new Map(),
+        enumerators: new Map(),
+    };
     const functions: IRFunction[] = [];
-    const init = FunctionCompiler.synthetic("@init", root);
+    const init = FunctionCompiler.synthetic("@init", ctx, root);
 
-    for (const item of root.namedChildren) {
-        compileTopLevelItem(item, functions, init);
-    }
+    for (const item of root.namedChildren)
+        compileTopLevelItem(item, ctx, functions, init);
 
     if (init.hasInstructions()) functions.unshift(init.finish());
     return functions;
@@ -1137,45 +1263,39 @@ export function compileProgram(root: SyntaxNode): IRFunction[] {
 
 function compileTopLevelItem(
     item: SyntaxNode,
+    ctx: ModuleCtx,
     functions: IRFunction[],
     init: FunctionCompiler
 ): void {
     switch (item.type) {
         case "function_definition":
-            functions.push(new FunctionCompiler(item).compile());
+            functions.push(new FunctionCompiler(item, ctx).compile());
             return;
-
         case "declaration":
-            // global variable(s) -> static ALLOC + initializer STOREs into @init;
-            // bare prototypes carry no storage and are skipped inside emitDeclaration.
             init.compileGlobalDeclaration(item);
             return;
-
         case "type_definition":
+            registerTypedef(item, ctx);
+            return;
         case "struct_specifier":
         case "union_specifier":
-        case "enum_specifier":
-            // Compile-time only: emit nothing. The AST->CType resolver (next
-            // component) registers these into the module type table.
+            resolveAggregate(item, ctx);
             return;
-
+        case "enum_specifier":
+            resolveEnum(item, ctx);
+            return;
         case "linkage_specification": {
-            // extern "C" { ... } -> unwrap and recurse over the body.
             const body = item.childForFieldName("body");
             if (body?.type === "declaration_list")
                 for (const inner of body.namedChildren)
-                    compileTopLevelItem(inner, functions, init);
-            else if (body) compileTopLevelItem(body, functions, init);
+                    compileTopLevelItem(inner, ctx, functions, init);
+            else if (body) compileTopLevelItem(body, ctx, functions, init);
             return;
         }
-
         case "comment":
             return;
-
         default:
-            if (item.type.startsWith("preproc_")) return; // expect preprocessing upstream
-            // expression statements, assignments, bare calls, top-level if/for/etc.
-            // all reach here and are rejected.
+            if (item.type.startsWith("preproc_")) return;
             throw new CompileError(
                 "only variable declarations and function/struct/union/enum " +
                     "declarations are allowed at file scope",
