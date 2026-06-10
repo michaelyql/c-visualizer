@@ -3,7 +3,7 @@
 // (promotion, conversion, overflow, rounding) live in a separate ops module and
 // hand correctly-typed values to writeScalar.
 
-import { type CType } from "./compiler";
+import type { CType, Status } from "./compiler";
 
 export const LITTLE_ENDIAN = true; // model an x86/ARM little-endian target
 
@@ -66,11 +66,6 @@ interface Region {
     bytes: Uint8Array;
     initMask: Uint8Array; // 1 bit per backed byte; 1 = written at least once
 }
-
-export type Status =
-    | { kind: "running" }
-    | { kind: "halted"; exitCode: number }
-    | { kind: "fault"; reason: string; addr?: number };
 
 // Live byte window of one region + its init bits, bounded by the bump pointer
 // so the copy cost is proportional to live size, not the region cap.

@@ -52,3 +52,9 @@ Refer to [here](https://docs.google.com/document/d/13_Bc-l2FKMgwPx4dZb0sv7eMfYMH
 - copy-on-write / persistent data structure / [HAMT](https://en.wikipedia.org/wiki/Hash_array_mapped_trie) to store changes between states so as to avoid deep expensive copy of states, since each instruction/step only touches a small part of the state
 - add a debounce to compute the changes between states when user drags slider/clicks on next/prev/last/first
 - compressing data/arrays of large size (?)
+
+## Cases to consider
+
+- How to handle preprocessor directives like #define and #include
+    - To disallow #define? Too restrictive? But can add support later
+    - Disallow #include - provide a set of predefined core functions like malloc, printf, free

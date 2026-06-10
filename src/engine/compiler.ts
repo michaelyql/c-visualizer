@@ -1,6 +1,6 @@
 import type { Node as SyntaxNode } from "web-tree-sitter";
 
-import type { RegionId, Status } from "./memory";
+import type { RegionId } from "./memory";
 
 // member field of struct/union
 export interface Member {
@@ -59,7 +59,12 @@ interface RegionImage {
     next: number; // bump pointer (defines the live range when sliced)
 }
 
-interface MemObject {
+export type Status =
+    | { kind: "running" }
+    | { kind: "halted"; exitCode: number }
+    | { kind: "fault"; reason: string; addr?: number };
+
+export interface MemObject {
     address: number;
     type: CType;
     name?: string; // named variable; absent for heap/anonymous
@@ -115,6 +120,7 @@ type Op =
           name: string;
           ctype: CType;
           storage: "static" | "automatic";
+          offset: number;
       }
     | { op: "ENTER_SCOPE" }
     | { op: "EXIT_SCOPE" }
@@ -125,14 +131,15 @@ type Op =
     | { op: "RET"; hasValue: boolean }
     | { op: "POP" };
 
-type Instr = Op & { node: SyntaxNode }; // node = source span, for highlighting
+export type Instr = Op & { node: SyntaxNode }; // node = source span, for highlighting
 
 export interface IRFunction {
     name: string;
-    params: { name: string; type: CType }[];
+    params: { name: string; type: CType; offset: number }[];
     returnType: CType;
     instructions: Instr[];
     variadic: boolean;
+    frameSize: number;
 }
 
 class CompileError extends Error {
@@ -160,6 +167,9 @@ class FunctionCompiler {
     private fn: SyntaxNode | null;
     private synthName: string | null = null; // set for compiler-generated fns (@init)
     private fallback: SyntaxNode | null = null; // span for synthetic instructions
+    private frameCursor = 0; // next free byte offset in the current frame
+    private frameSize = 0; // high-water mark over all scopes = frame size
+    private scopeMarks: number[] = []; // saved cursors for structural scope nesting
 
     private ctx: ModuleCtx;
 
@@ -189,17 +199,38 @@ class FunctionCompiler {
         if (fnDecl.type != "function_declarator")
             throw new CompileError("not a function declarator", this.fn);
         const name = declaratorName(fnDecl.childForFieldName("declarator")!);
-
-        const { params, variadic } = this.extractParams(
+        const { params: rawParams, variadic } = this.extractParams(
             fnDecl.childForFieldName("parameters")!
         );
-        const returnType = base; // pointer-returning fns (int *f()) not yet applied
-
-        const body = this.fn.childForFieldName("body")!; // base scope of the frame
+        const params = this.layoutParams(rawParams); // leading frame slots; seeds the cursor
+        const returnType = base;
+        const body = this.fn.childForFieldName("body")!;
         this.compileBlockItems(body);
-        this.ensureTrailingRet(body); // implicit return if control falls off
+        this.ensureTrailingRet(body);
+        return {
+            name,
+            params,
+            returnType,
+            instructions: this.code,
+            variadic,
+            frameSize: this.frameSize,
+        };
+    }
 
-        return { name, params, returnType, instructions: this.code, variadic };
+    private layoutParams(
+        raw: { name: string; type: CType }[]
+    ): { name: string; type: CType; offset: number }[] {
+        let cursor = 0;
+        const out = raw.map((p) => {
+            const a = alignOf(p.type);
+            cursor = roundUp(cursor, a);
+            const offset = cursor;
+            cursor += sizeOf(p.type);
+            return { ...p, offset };
+        });
+        this.frameCursor = cursor;
+        this.frameSize = cursor;
+        return out;
     }
 
     private ensureTrailingRet(node: SyntaxNode): void {
@@ -221,6 +252,7 @@ class FunctionCompiler {
             returnType: VOID,
             instructions: this.code,
             variadic: false,
+            frameSize: this.frameSize,
         };
     }
 
@@ -246,9 +278,20 @@ class FunctionCompiler {
                     ? d.childForFieldName("declarator")!
                     : d;
             const ctype = applyDeclaratorType(base, inner);
-            if (skipFunctionDecls && ctype.kind === "function") continue; // prototype
+            if (skipFunctionDecls && ctype.kind === "function") continue;
             const name = declaratorName(inner);
-            this.emit({ op: "ALLOC", name, ctype, storage }, d);
+
+            let offset = 0;
+            if (storage === "automatic") {
+                const a = alignOf(ctype);
+                this.frameCursor = roundUp(this.frameCursor, a);
+                offset = this.frameCursor;
+                this.frameCursor += sizeOf(ctype);
+                if (this.frameCursor > this.frameSize)
+                    this.frameSize = this.frameCursor;
+            }
+            this.emit({ op: "ALLOC", name, ctype, storage, offset }, d);
+
             if (d.type === "init_declarator") {
                 const value = d.childForFieldName("value")!;
                 if (value.type === "initializer_list")
@@ -256,10 +299,10 @@ class FunctionCompiler {
                         "aggregate/array initializers not yet supported",
                         value
                     );
-                this.emit({ op: "LOAD_ADDR", name }, inner); // store initializer
+                this.emit({ op: "LOAD_ADDR", name }, inner);
                 this.compileExpr(value);
                 this.emit({ op: "STORE" }, d);
-                this.emit({ op: "POP" }, d); // discard the value STORE pushes
+                this.emit({ op: "POP" }, d);
             }
         }
     }
@@ -390,13 +433,16 @@ class FunctionCompiler {
                 return this.compileBreak(node);
             case "continue_statement":
                 return this.compileContinue(node);
-            case "compound_statement":
+            case "compound_statement": {
                 this.emit({ op: "ENTER_SCOPE" }, node);
                 this.scopeDepth++;
+                this.scopeMarks.push(this.frameCursor);
                 this.compileBlockItems(node);
+                this.frameCursor = this.scopeMarks.pop()!; // siblings reuse these slots
                 this.emit({ op: "EXIT_SCOPE" }, node);
                 this.scopeDepth--;
                 return;
+            }
             default:
                 throw new CompileError(
                     `unsupported statement '${node.type}'`,
@@ -472,6 +518,7 @@ class FunctionCompiler {
         const outer = this.scopeDepth;
         this.emit({ op: "ENTER_SCOPE" }, node);
         this.scopeDepth++; // for-header scope
+        this.scopeMarks.push(this.frameCursor);
         const headerDepth = this.scopeDepth;
 
         const init = node.childForFieldName("initializer");
@@ -507,6 +554,7 @@ class FunctionCompiler {
         this.emit({ op: "JUMP", target: condLabel }, node);
 
         if (exit !== UNPATCHED) this.patch(exit, this.here());
+        this.frameCursor = this.scopeMarks.pop()!;
         this.emit({ op: "EXIT_SCOPE" }, node);
         this.scopeDepth--; // normal-exit path leaves header scope
         const end = this.here(); // break lands here, already unwound
@@ -1239,6 +1287,42 @@ export function alignOf(t: CType): number {
         case "function":
             throw new Error(`alignOf(${t.kind})`);
     }
+}
+
+export function convert(value: number | bigint, to: CType): number | bigint {
+    switch (to.kind) {
+        case "bool":
+            return toBool(value) ? 1 : 0;
+        case "int":
+            return wrapInt(value, to.bits, to.signed);
+        case "enum":
+            return wrapInt(value, 32, true);
+        case "pointer":
+            return wrapInt(value, 64, false); // stored/compared as u64
+        case "float": {
+            const n = typeof value === "bigint" ? Number(value) : value;
+            return to.bits === 32 ? Math.fround(n) : n;
+        }
+        case "void":
+            return 0; // (void)x discards
+        default:
+            throw new Error(`cannot convert to ${to.kind}`);
+    }
+}
+
+function toBool(v: number | bigint): boolean {
+    return typeof v === "bigint" ? v !== 0n : v !== 0 && !Number.isNaN(v);
+}
+
+// asIntN/asUintN wrap for any width; bigint for 64-bit, number otherwise (matches the memory layer).
+function wrapInt(
+    value: number | bigint,
+    bits: 8 | 16 | 32 | 64,
+    signed: boolean
+): number | bigint {
+    let v = typeof value === "bigint" ? value : BigInt(Math.trunc(value));
+    v = signed ? BigInt.asIntN(bits, v) : BigInt.asUintN(bits, v);
+    return bits === 64 ? v : Number(v);
 }
 
 // usage:
