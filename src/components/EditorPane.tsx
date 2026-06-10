@@ -105,6 +105,7 @@ function EditorPane({ code, setCode, lightMode }: EditorPaneProps) {
                     );
                 }}
                 placeholder={"Enter something to get started!"}
+                basicSetup={{ tabSize: 4 }}
             />
         </div>
     );

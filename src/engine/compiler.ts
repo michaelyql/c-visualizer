@@ -1,22 +1,72 @@
 import type { Node as SyntaxNode } from "web-tree-sitter";
 
+import { type RegionId } from "./memory";
+
+interface Member {
+    name: string;
+    type: CType;
+}
+
 type CType =
     | { kind: "void" }
-    | { kind: "int"; bits: 8 | 16 | 32 | 64; signed: boolean }
-    | { kind: "float"; bits: 32 | 64 }
+    | { kind: "int"; bits: 8 | 16 | 32 | 64; signed: boolean } // char/short/int/long
+    | { kind: "float"; bits: 32 | 64 } // float/double
     | { kind: "bool" }
     | { kind: "pointer"; to: CType }
-    | { kind: "array"; of: CType; length: number | null }
+    | { kind: "array"; of: CType; length: number | null } // null = incomplete: int a[]
     | { kind: "function"; returns: CType; params: CType[]; variadic: boolean }
-    | { kind: "struct"; tag: string | null; members: null } // layout needs the type table
-    | { kind: "union"; tag: string | null; members: null }
-    | { kind: "enum"; tag: string | null; underlying: CType };
+    | { kind: "struct"; tag: string | null; members: Member[] | null } // null = forward-declared
+    | { kind: "union"; tag: string | null; members: Member[] | null }
+    | {
+          kind: "enum";
+          tag: string | null;
+          underlying: { kind: "int"; bits: 32; signed: true }; // always int for C99
+      };
 
 const VOID: CType = { kind: "void" };
 const BOOL: CType = { kind: "bool" };
 const CHAR: CType = { kind: "int", bits: 8, signed: true };
 const INT: CType = { kind: "int", bits: 32, signed: true };
 const F64: CType = { kind: "float", bits: 64 };
+
+type Status =
+    | { kind: "running" }
+    | { kind: "halted"; exitCode: number }
+    | { kind: "fault"; reason: string; addr?: number };
+
+// Live byte window of one region + its init bits, bounded by the bump pointer
+// so the copy cost is proportional to live size, not the region cap.
+interface RegionImage {
+    bytes: Uint8Array; // copy of the live range
+    initMask: Uint8Array; // copy of init bits over the same range
+    next: number; // bump pointer (defines the live range when sliced)
+}
+
+interface MemObject {
+    address: number;
+    type: CType;
+    name?: string; // named variable; absent for heap/anonymous
+    region: RegionId;
+    size: number;
+    lifecycle: "alive" | "freed"; // freed kept (addresses never reused) for UAF
+}
+
+interface ScopeView {
+    bindings: Map<string, number>;
+} // name -> address
+interface FrameView {
+    func: string;
+    scopes: ScopeView[];
+} // innermost scope last
+
+export interface Snapshot {
+    regions: Record<RegionId, RegionImage>;
+    objects: Map<number, MemObject>; // keyed by address; grows monotonically
+    frames: FrameView[]; // call stack, index 0 = main
+    highlight: { startByte: number; endByte: number } | null; // source span
+    stdout: string; // output accumulated so far
+    status: Status;
+}
 
 // ───────────────────────── IR instruction set ─────────────────────────
 // Value-stack contract:
@@ -88,10 +138,104 @@ class FunctionCompiler {
         breakDepth: number;
         contDepth: number;
     }[] = [];
-    private fn: SyntaxNode;
+    private fn: SyntaxNode | null;
+    private synthName: string | null = null; // set for compiler-generated fns (@init)
+    private fallback: SyntaxNode | null = null; // span for synthetic instructions
 
-    constructor(fn: SyntaxNode) {
+    constructor(fn: SyntaxNode | null) {
         this.fn = fn;
+    }
+
+    // A compiler-generated function with no source declarator (e.g. @init for globals).
+    // `fallback` supplies a source span for any synthetic instruction (the trailing RET).
+    static synthetic(name: string, fallback: SyntaxNode): FunctionCompiler {
+        const fc = new FunctionCompiler(null);
+        fc.synthName = name;
+        fc.fallback = fallback;
+        return fc;
+    }
+
+    compile(): IRFunction {
+        if (!this.fn)
+            throw new Error("compile() on a synthetic compiler; use finish()");
+        const base = baseType(this.fn.childForFieldName("type")!);
+        const fnDecl = this.fn.childForFieldName("declarator")!;
+        if (fnDecl.type != "function_declarator")
+            throw new CompileError("not a function declarator", this.fn);
+        const name = declaratorName(fnDecl.childForFieldName("declarator")!);
+
+        const { params, variadic } = this.extractParams(
+            fnDecl.childForFieldName("parameters")!
+        );
+        const returnType = base; // pointer-returning fns (int *f()) not yet applied
+
+        const body = this.fn.childForFieldName("body")!; // base scope of the frame
+        this.compileBlockItems(body);
+        this.ensureTrailingRet(body); // implicit return if control falls off
+
+        return { name, params, returnType, instructions: this.code, variadic };
+    }
+
+    private ensureTrailingRet(node: SyntaxNode): void {
+        const last = this.code[this.code.length - 1];
+        if (!last || last.op !== "RET")
+            this.emit({ op: "RET", hasValue: false }, node);
+    }
+
+    hasInstructions(): boolean {
+        return this.code.length > 0;
+    }
+
+    // Build the IRFunction for a synthetic function (void, no params).
+    finish(): IRFunction {
+        this.ensureTrailingRet(this.fallback!);
+        return {
+            name: this.synthName!,
+            params: [],
+            returnType: VOID,
+            instructions: this.code,
+            variadic: false,
+        };
+    }
+
+    private compileDeclaration(node: SyntaxNode): void {
+        this.emitDeclaration(node, this.declarationStorage(node), false);
+    }
+
+    // File-scope variables have static storage; a bare prototype (int foo(int);)
+    // declares no storage and is skipped — calls resolve by name at runtime.
+    compileGlobalDeclaration(node: SyntaxNode): void {
+        this.emitDeclaration(node, "static", true);
+    }
+
+    private emitDeclaration(
+        node: SyntaxNode,
+        storage: "static" | "automatic",
+        skipFunctionDecls: boolean
+    ): void {
+        const base = baseType(node.childForFieldName("type")!);
+        for (const d of node.childrenForFieldName("declarator")) {
+            const inner =
+                d.type === "init_declarator"
+                    ? d.childForFieldName("declarator")!
+                    : d;
+            const ctype = applyDeclaratorType(base, inner);
+            if (skipFunctionDecls && ctype.kind === "function") continue; // prototype
+            const name = declaratorName(inner);
+            this.emit({ op: "ALLOC", name, ctype, storage }, d);
+            if (d.type === "init_declarator") {
+                const value = d.childForFieldName("value")!;
+                if (value.type === "initializer_list")
+                    throw new CompileError(
+                        "aggregate/array initializers not yet supported",
+                        value
+                    );
+                this.emit({ op: "LOAD_ADDR", name }, inner); // store initializer
+                this.compileExpr(value);
+                this.emit({ op: "STORE" }, d);
+                this.emit({ op: "POP" }, d); // discard the value STORE pushes
+            }
+        }
     }
 
     private emit(op: Op, node: SyntaxNode): number {
@@ -111,55 +255,83 @@ class FunctionCompiler {
             i.target = target;
     }
 
-    compile(): IRFunction {
-        const base = baseType(this.fn.childForFieldName("type")!);
-        const fnDecl = findFunctionDeclarator(
-            this.fn.childForFieldName("declarator")!
-        );
-        if (!fnDecl)
-            throw new CompileError("not a function declarator", this.fn);
-
-        const name = declaratorName(fnDecl.childForFieldName("declarator")!);
-        const { params, variadic } = this.extractParams(
-            fnDecl.childForFieldName("parameters")!
-        );
-        const returnType = base; // pointer-returning functions (int *f()) not yet applied
-
-        const body = this.fn.childForFieldName("body")!; // function body = the frame's base scope
-        this.compileBlockItems(body);
-
-        const last = this.code[this.code.length - 1]; // implicit return if control falls off
-        if (!last || last.op !== "RET")
-            this.emit({ op: "RET", hasValue: false }, body);
-
-        return { name, params, returnType, instructions: this.code, variadic };
-    }
-
     private extractParams(list: SyntaxNode): {
         params: { name: string; type: CType }[];
         variadic: boolean;
     } {
+        const children = list.namedChildren.filter(
+            (c) =>
+                c.type === "parameter_declaration" ||
+                c.type === "variadic_parameter"
+        );
+
+        // fn() -> unspecified argument count
+        if (children.length === 0) {
+            return { params: [], variadic: true };
+        }
+
+        // fn(void) -> exactly zero parameters
+        const only = children[0];
+        if (
+            children.length === 1 &&
+            only.type === "parameter_declaration" &&
+            baseType(only.childForFieldName("type")!).kind === "void" &&
+            !only.childForFieldName("declarator") // void param cannot be named
+        ) {
+            return { params: [], variadic: false };
+        }
+
         const params: { name: string; type: CType }[] = [];
         let variadic = false;
-        for (const c of list.namedChildren) {
+
+        for (let i = 0; i < children.length; i++) {
+            const c = children[i];
+
             if (c.type === "variadic_parameter") {
+                // C99: '...' must follow >=1 named parameter and be last
+                if (i === 0) {
+                    throw new CompileError(
+                        "error: ISO C requires a named parameter before '...'",
+                        c
+                    );
+                }
+                if (i !== children.length - 1) {
+                    throw new CompileError(
+                        "error: '...' must be the last parameter",
+                        c
+                    );
+                }
                 variadic = true;
                 continue;
             }
-            if (c.type !== "parameter_declaration") continue;
+
+            // parameter_declaration
             const tNode = c.childForFieldName("type");
             if (!tNode) continue;
             const t = baseType(tNode);
             const d = c.childForFieldName("declarator");
-            if (!d) {
-                if (t.kind === "void") return { params: [], variadic: false };
-                continue;
+
+            // void is only legal as the sole, unnamed parameter (handled above);
+            // reaching here means it's mixed with others or named
+            if (t.kind === "void" && !d) {
+                throw new CompileError(
+                    "error: 'void' must be the only parameter",
+                    c
+                );
             }
+
+            if (!d) {
+                // unnamed prototype parameter, e.g. fn(int, int)
+                // but function definition requires named parameters
+                throw new CompileError("unnamed parameter", c);
+            }
+
             params.push({
                 name: declaratorName(d),
                 type: applyDeclaratorType(t, d),
             });
         }
+
         return { params, variadic };
     }
 
@@ -214,47 +386,6 @@ class FunctionCompiler {
             )
                 return "static";
         return "automatic";
-    }
-
-    private compileDeclaration(node: SyntaxNode): void {
-        const base = baseType(node.childForFieldName("type")!);
-        const storage = this.declarationStorage(node);
-        for (const d of node.childrenForFieldName("declarator")) {
-            if (d.type === "init_declarator") {
-                const inner = d.childForFieldName("declarator")!;
-                const name = declaratorName(inner);
-                this.emit(
-                    {
-                        op: "ALLOC",
-                        name,
-                        ctype: applyDeclaratorType(base, inner),
-                        storage,
-                    },
-                    d
-                );
-                const value = d.childForFieldName("value")!;
-                if (value.type === "initializer_list")
-                    throw new CompileError(
-                        "aggregate/array initializers not yet supported",
-                        value
-                    );
-                this.emit({ op: "LOAD_ADDR", name }, inner); // store the initializer into the new object
-                this.compileExpr(value);
-                this.emit({ op: "STORE" }, d);
-                this.emit({ op: "POP" }, d); // discard the value STORE pushes
-            } else {
-                const name = declaratorName(d);
-                this.emit(
-                    {
-                        op: "ALLOC",
-                        name,
-                        ctype: applyDeclaratorType(base, d),
-                        storage,
-                    },
-                    d
-                );
-            }
-        }
     }
 
     private compileExprStatement(node: SyntaxNode): void {
@@ -828,17 +959,227 @@ function charValue(node: SyntaxNode): number {
     return unescapeC(inner).codePointAt(0) ?? 0;
 }
 
+type NodeType =
+    // Root
+    | "translation_unit"
+
+    // Preprocessor
+    | "preproc_include"
+    | "preproc_def"
+    | "preproc_function_def"
+    | "preproc_params"
+    | "preproc_call"
+    | "preproc_if"
+    | "preproc_ifdef"
+    | "preproc_else"
+    | "preproc_elif"
+    | "preproc_elifdef"
+    | "preproc_arg"
+    | "preproc_directive"
+    | "preproc_defined"
+
+    // Definitions & declarations
+    | "function_definition"
+    | "declaration"
+    | "type_definition"
+    | "init_declarator"
+    | "declaration_list"
+    | "linkage_specification"
+    | "parameter_list"
+    | "parameter_declaration"
+    | "variadic_parameter"
+
+    // Declarators
+    | "pointer_declarator"
+    | "function_declarator"
+    | "array_declarator"
+    | "parenthesized_declarator"
+    | "attributed_declarator"
+    | "abstract_pointer_declarator"
+    | "abstract_function_declarator"
+    | "abstract_array_declarator"
+    | "abstract_parenthesized_declarator"
+
+    // Type specifiers & qualifiers
+    | "primitive_type"
+    | "sized_type_specifier"
+    | "type_identifier"
+    | "type_qualifier"
+    | "storage_class_specifier"
+    | "alignas_qualifier"
+    | "type_descriptor"
+    | "macro_type_specifier"
+
+    // Structs / unions / enums
+    | "struct_specifier"
+    | "union_specifier"
+    | "field_declaration_list"
+    | "field_declaration"
+    | "bitfield_clause"
+    | "enum_specifier"
+    | "enumerator_list"
+    | "enumerator"
+
+    // Statements
+    | "compound_statement"
+    | "expression_statement"
+    | "if_statement"
+    | "else_clause"
+    | "switch_statement"
+    | "case_statement"
+    | "while_statement"
+    | "do_statement"
+    | "for_statement"
+    | "return_statement"
+    | "break_statement"
+    | "continue_statement"
+    | "goto_statement"
+    | "labeled_statement"
+    | "attributed_statement"
+
+    // Expressions
+    | "binary_expression"
+    | "unary_expression"
+    | "update_expression"
+    | "assignment_expression"
+    | "conditional_expression"
+    | "comma_expression"
+    | "pointer_expression"
+    | "cast_expression"
+    | "sizeof_expression"
+    | "alignof_expression"
+    | "offsetof_expression"
+    | "generic_expression"
+    | "extension_expression"
+    | "call_expression"
+    | "argument_list"
+    | "subscript_expression"
+    | "field_expression"
+    | "parenthesized_expression"
+    | "compound_literal_expression"
+
+    // Initializers
+    | "initializer_list"
+    | "initializer_pair"
+    | "subscript_designator"
+    | "subscript_range_designator"
+    | "field_designator"
+
+    // Literals & terminals
+    | "identifier"
+    | "field_identifier"
+    | "statement_identifier"
+    | "number_literal"
+    | "char_literal"
+    | "character"
+    | "string_literal"
+    | "string_content"
+    | "concatenated_string"
+    | "escape_sequence"
+    | "system_lib_string"
+    | "true"
+    | "false"
+    | "null"
+
+    /*
+    // GNU asm
+    | "gnu_asm_expression"
+    | "gnu_asm_qualifier"
+    | "gnu_asm_output_operand_list"
+    | "gnu_asm_output_operand"
+    | "gnu_asm_input_operand_list"
+    | "gnu_asm_input_operand"
+    | "gnu_asm_clobber_list"
+    | "gnu_asm_goto_list"
+    */
+
+    /*
+    // MS extensions / SEH
+    | "ms_call_modifier"
+    | "ms_declspec_modifier"
+    | "ms_based_modifier"
+    | "ms_pointer_modifier"
+    | "ms_restrict_modifier"
+    | "ms_unsigned_ptr_modifier"
+    | "ms_signed_ptr_modifier"
+    | "ms_unaligned_ptr_modifier"
+    | "seh_try_statement"
+    | "seh_except_clause"
+    | "seh_finally_clause"
+    | "seh_leave_statement"
+    */
+
+    // Attributes
+    | "attribute_specifier"
+    | "attribute_declaration"
+    | "attribute"
+
+    // Misc
+    | "comment"
+    | "ERROR"
+    | "MISSING";
+
 // usage:
 //   const funcs  = compileProgram(tree.rootNode);
 //   const byName = new Map(funcs.map(f => [f.name, f]));
-//   // VM frame: { fn: IRFunction; pc: number; ... };  CALL -> byName.get(fn) or a builtin (printf).
+//   // runtime runs "@init" (globals) first, then CALLs main.
 export function compileProgram(root: SyntaxNode): IRFunction[] {
-    const fns: IRFunction[] = [];
+    const functions: IRFunction[] = [];
+    const init = FunctionCompiler.synthetic("@init", root);
+
     for (const item of root.namedChildren) {
-        if (item.type === "function_definition")
-            fns.push(new FunctionCompiler(item).compile());
-        // file-scope declarations/typedefs/tags: handle in a separate hoisting pre-pass
-        // that also populates the compile-time type table this compiler will need for structs.
+        compileTopLevelItem(item, functions, init);
     }
-    return fns;
+
+    if (init.hasInstructions()) functions.unshift(init.finish());
+    return functions;
+}
+
+function compileTopLevelItem(
+    item: SyntaxNode,
+    functions: IRFunction[],
+    init: FunctionCompiler
+): void {
+    switch (item.type) {
+        case "function_definition":
+            functions.push(new FunctionCompiler(item).compile());
+            return;
+
+        case "declaration":
+            // global variable(s) -> static ALLOC + initializer STOREs into @init;
+            // bare prototypes carry no storage and are skipped inside emitDeclaration.
+            init.compileGlobalDeclaration(item);
+            return;
+
+        case "type_definition":
+        case "struct_specifier":
+        case "union_specifier":
+        case "enum_specifier":
+            // Compile-time only: emit nothing. The AST->CType resolver (next
+            // component) registers these into the module type table.
+            return;
+
+        case "linkage_specification": {
+            // extern "C" { ... } -> unwrap and recurse over the body.
+            const body = item.childForFieldName("body");
+            if (body?.type === "declaration_list")
+                for (const inner of body.namedChildren)
+                    compileTopLevelItem(inner, functions, init);
+            else if (body) compileTopLevelItem(body, functions, init);
+            return;
+        }
+
+        case "comment":
+            return;
+
+        default:
+            if (item.type.startsWith("preproc_")) return; // expect preprocessing upstream
+            // expression statements, assignments, bare calls, top-level if/for/etc.
+            // all reach here and are rejected.
+            throw new CompileError(
+                "only variable declarations and function/struct/union/enum " +
+                    "declarations are allowed at file scope",
+                item
+            );
+    }
 }

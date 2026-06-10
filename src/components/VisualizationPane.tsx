@@ -1,36 +1,36 @@
-import { type ExecutionState } from "../engine/types";
+import type { Snapshot } from "../engine/compiler";
 
 type VisualizationPaneProps = {
-    executionState: ExecutionState | null;
+    snapshot: Snapshot | null;
 };
 
-function VisualizationPane({ executionState }: VisualizationPaneProps) {
-    if (!executionState) {
+function VisualizationPane({ snapshot }: VisualizationPaneProps) {
+    if (!snapshot) {
         return (
             <div className="visualization-pane">Press Run to execute code.</div>
         );
     }
 
     // Render syntax/runtime errors
-    if (executionState.errors && executionState.errors.length > 0) {
-        return (
-            <div className="visualization-pane">
-                <h2 className="visualization-error-title">Errors</h2>
+    // if (snapshot.errors && snapshot.errors.length > 0) {
+    //     return (
+    //         <div className="visualization-pane">
+    //             <h2 className="visualization-error-title">Errors</h2>
 
-                {executionState.errors.map((error, index) => (
-                    <div key={index} className="visualization-error-card">
-                        <div>
-                            <strong>{error.message}</strong>
-                        </div>
+    //             {executionState.errors.map((error, index) => (
+    //                 <div key={index} className="visualization-error-card">
+    //                     <div>
+    //                         <strong>{error.message}</strong>
+    //                     </div>
 
-                        <div className="visualization-error-location">
-                            Line {error.line}, Column {error.column}
-                        </div>
-                    </div>
-                ))}
-            </div>
-        );
-    }
+    //                     <div className="visualization-error-location">
+    //                         Line {error.line}, Column {error.column}
+    //                     </div>
+    //                 </div>
+    //             ))}
+    //         </div>
+    //     );
+    // }
 
     return (
         <div className="visualization-pane">

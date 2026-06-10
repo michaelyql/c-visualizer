@@ -10,11 +10,11 @@ export async function initializeParser() {
         locateFile(scriptName: string) {
             scriptName;
             // tells the WASM loader where to find web-tree-sitter.wasm
-            return "/tree-sitter/web-tree-sitter.wasm";
+            return "/c-visualizer/tree-sitter/web-tree-sitter.wasm";
         },
     });
 
-    C = await Language.load("/tree-sitter/tree-sitter-c.wasm");
+    C = await Language.load("/c-visualizer/tree-sitter/tree-sitter-c.wasm");
 
     parser = new Parser();
     parser.setLanguage(C);

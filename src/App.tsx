@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
-import { initializeParser } from "./engine/parser";
+import { initializeParser, parseCode } from "./engine/parser";
 
 import EditorPane from "./components/EditorPane";
 import VisualizationPane from "./components/VisualizationPane";
 
-import { type ExecutionState } from "./engine/types";
-
+import { compileProgram } from "./engine/compiler";
+import { prettyPrintTree } from "./engine/util";
 import "./styles.css";
+
+import type { Snapshot } from "./engine/compiler";
 
 const initialCode = `#include <stdio.h>
 
@@ -38,18 +40,23 @@ function App() {
         document.body.classList.toggle("light-mode", lightMode);
     }, [lightMode]);
 
-    const [executionState, setExecutionState] = useState<ExecutionState | null>(
-        null
-    );
+    const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
 
     function handleRun() {
+        const tree = parseCode(code);
+        console.log(tree.rootNode.toString());
+        console.log(prettyPrintTree(tree.rootNode, { showText: true }));
+        let functions = compileProgram(tree.rootNode);
+        for (let fn of functions) {
+            console.log(fn);
+        }
         // const result = runCode(code);
         // setExecutionState(result);
     }
 
     function handleReset() {
         setCode(initialCode);
-        setExecutionState(null);
+        setSnapshot(null);
     }
     // TODO: Add caching for user's most recently entered code
     // With expiry of 1 week
@@ -84,7 +91,7 @@ function App() {
                     lightMode={lightMode}
                 />
 
-                <VisualizationPane executionState={executionState} />
+                <VisualizationPane snapshot={snapshot} />
             </div>
         </div>
     );
