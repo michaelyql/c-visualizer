@@ -25,8 +25,7 @@ interface Activation {
     fn: IRFunction;
     pc: number;
     scopes: Scope[]; // innermost last; scopes[0] holds params + top-level locals
-    frameBase: number;
-    savedStackNext: number;
+    frameBase: number; // HIGHEST address of the stack frame (i.e. start of stack frame)
 }
 
 /**
@@ -34,6 +33,7 @@ interface Activation {
  * based on the custom instruction set
  *
  * An instance is created by supplying it with a list of `IRFunction` to run, and calling `.run()` on the instance
+ *
  */
 export class VM {
     mem = new Memory();
@@ -49,6 +49,9 @@ export class VM {
     stdout = "";
     status: Status = { kind: "running" };
 
+    // Map from function name to IRFunction
+    // TODO:
+    // Technically should be from function signature (name+params) to allow function overloading
     private byName: Map<string, IRFunction>;
     private traceEnabled = false;
 
@@ -81,9 +84,14 @@ export class VM {
             const f = this.callStack[this.callStack.length - 1];
             const pc = f.pc;
             const instr = f.fn.instructions[f.pc++];
+
             if (this.traceEnabled)
-                console.log(`#${pc} ${f.fn.name}: ${describeInstr(instr)}`);
+                console.log(
+                    `fn=${f.fn.name},pc=${pc},bp=${f.frameBase.toString(16)}  ${describeInstr(instr)}`
+                );
+
             this.exec(instr);
+
             if (this.traceEnabled)
                 console.log(
                     `    stack [${this.valueStack.map(fmtVal).join(", ")}]  depth ${this.callStack.length}`
@@ -111,18 +119,29 @@ export class VM {
         this.status = { kind: "fault", reason, addr };
     }
 
+    /**
+     * Pushes an `Activation` frame onto the call stack
+     * @param fn The `IRFunction` to enter
+     * @returns The `Activation` frame representing the function
+     */
     private enter(fn: IRFunction): Activation {
-        const savedStackNext = this.stackNext;
-        const frameBase = (this.stackNext - fn.frameSize) & ~15;
-        if (fn.frameSize > 0 && "kind" in this.mem.resolve(frameBase))
-            this.fault("stack overflow", frameBase);
-        this.stackNext = frameBase;
+        // x86-64 ABI mandates that stack frames are 16-byte aligned, i.e.
+        // i.e. stack frame base addresses are 0x10, 0x20, ... (always ending in 0)
+        const newSP = (this.stackNext - fn.frameSize) & -15;
+
+        // check for overflow
+        if (newSP < this.heapNext) {
+            this.fault("stack overflow", this.stackNext);
+        }
+
+        const frameBase = this.stackNext;
+        this.stackNext = newSP;
+
         const act: Activation = {
             fn,
             pc: 0,
             scopes: [{ bindings: new Map() }],
             frameBase,
-            savedStackNext,
         };
         this.callStack.push(act);
         return act;
@@ -138,6 +157,11 @@ export class VM {
             this.fault(`bad write at 0x${addr.toString(16)} (${f.kind})`, addr);
     }
 
+    /**
+     * Executes a single instruction from the instruction set.
+     * @param instr
+     * @returns
+     */
     private exec(instr: Instr): void {
         switch (instr.op) {
             case "PUSH_CONST": {
@@ -172,10 +196,11 @@ export class VM {
             case "ALLOC": {
                 const size = sizeOf(instr.ctype);
                 if (instr.storage === "static") {
+                    // static memory grows up
                     this.staticNext = align(
                         this.staticNext,
                         alignOf(instr.ctype)
-                    );
+                    ); // round up to multiple of ctype's size
                     const addr = this.staticNext;
                     this.staticNext += size;
                     this.mem.writeBytes(addr, new Uint8Array(size)); // zero-init + mark initialized
@@ -189,7 +214,11 @@ export class VM {
                         lifecycle: "alive",
                     });
                 } else {
-                    const addr = this.top().frameBase + instr.offset; // bytes stay uninitialized
+                    // stack grows down
+                    const addr =
+                        this.top().frameBase -
+                        instr.offset -
+                        sizeOf(instr.ctype); // bytes stay uninitialized
                     this.currentScope().bindings.set(instr.name, addr);
                     this.objects.set(addr, {
                         address: addr,
@@ -317,18 +346,27 @@ export class VM {
                 const args: RtValue[] = [];
                 for (let i = 0; i < instr.argc; i++)
                     args.unshift(this.valueStack.pop()!);
+
                 const act = this.enter(callee);
                 if (this.status.kind !== "running") return;
+
+                // should this be failing silently if the lengths don't match?
                 const n = Math.min(callee.params.length, args.length);
+
                 for (let i = 0; i < n; i++) {
                     const p = callee.params[i];
-                    const addr = act.frameBase + p.offset;
+
+                    // should this be + offset?
+                    // now offsets are positive values, so maybe this should be -p.offset
+                    const addr = act.frameBase - p.offset - sizeOf(p.type);
                     this.storeScalar(
                         addr,
                         p.type,
                         convert(args[i].value, p.type)
                     );
                     if (this.status.kind !== "running") return;
+
+                    // bind variable names in the initial block scope
                     act.scopes[0].bindings.set(p.name, addr);
                     this.objects.set(addr, {
                         address: addr,
@@ -346,7 +384,7 @@ export class VM {
                 let ret: RtValue | null = null;
                 if (instr.hasValue) ret = this.valueStack.pop() ?? null;
                 const act = this.callStack.pop()!;
-                this.stackNext = act.savedStackNext;
+                this.stackNext = act.frameBase;
                 if (this.callStack.length === 0) {
                     const code = ret ? Number(convert(ret.value, INT32)) : 0;
                     this.status = { kind: "halted", exitCode: code };
@@ -429,7 +467,7 @@ function typeName(t: CType): string {
     }
 }
 function fmtVal(v: RtValue): string {
-    return `${v.value}:${typeName(v.type)}`;
+    return `${v.value as number}:${typeName(v.type)}`;
 }
 function describeInstr(i: Instr): string {
     switch (i.op) {
