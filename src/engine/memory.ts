@@ -1,9 +1,4 @@
-// memory.ts — dense ArrayBuffer-backed C virtual memory.
-// Replaces the sparse Map<Address, number>. Raw bytes only; C value semantics
-// (promotion, conversion, overflow, rounding) live in a separate ops module and
-// hand correctly-typed values to writeScalar.
-
-import type { CType, Status } from "./compiler";
+import type { CType } from "./compiler";
 
 export const LITTLE_ENDIAN = true; // model an x86/ARM little-endian target
 
@@ -67,14 +62,6 @@ interface Region {
     initMask: Uint8Array; // 1 bit per backed byte; 1 = written at least once
 }
 
-// Live byte window of one region + its init bits, bounded by the bump pointer
-// so the copy cost is proportional to live size, not the region cap.
-export interface RegionImage {
-    bytes: Uint8Array; // copy of the live range
-    initMask: Uint8Array; // copy of init bits over the same range
-    next: number; // bump pointer (defines the live range when sliced)
-}
-
 export interface MemObject {
     address: number;
     type: CType;
@@ -82,23 +69,6 @@ export interface MemObject {
     region: RegionId;
     size: number;
     lifecycle: "alive" | "freed"; // freed kept (addresses never reused) for UAF
-}
-
-export interface ScopeView {
-    bindings: Map<string, number>;
-} // name -> address
-export interface FrameView {
-    func: string;
-    scopes: ScopeView[];
-} // innermost scope last
-
-export interface Snapshot {
-    regions: Record<RegionId, RegionImage>;
-    objects: Map<number, MemObject>; // keyed by address; grows monotonically
-    frames: FrameView[]; // call stack, index 0 = main
-    highlight: { startByte: number; endByte: number } | null; // source span
-    stdout: string; // output accumulated so far
-    status: Status;
 }
 
 export function makeRegion(
@@ -119,6 +89,15 @@ export function makeRegion(
     };
 }
 
+/**
+ * Represents stack / heap / .data, .bss, .rodata segments
+ *
+ * Each region/segment of memory is backed by a Uint8Array
+ *
+ * Index i of the Uint8array represent the byte at address i
+ *
+ * Stack grows downwards, heap and static segment grow up
+ */
 export class Memory {
     private regions: Region[];
 

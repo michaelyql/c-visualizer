@@ -1,4 +1,3 @@
-// vm.ts — IR virtual machine over pre-allocated frames.
 // Control flow (CALL/RET/jumps/scopes) + memory/arithmetic (ALLOC/LOAD_ADDR/
 // LOAD/STORE/INDEX/BINARY/UNARY). FIELD is pending the {name} Op change.
 
@@ -19,6 +18,9 @@ const align = (n: number, a: number) => Math.ceil(n / a) * a;
 interface Scope {
     bindings: Map<string, number>; // name -> address
 }
+/**
+ * An activation frame i.e. "stack frame"
+ */
 interface Activation {
     fn: IRFunction;
     pc: number;
@@ -27,27 +29,12 @@ interface Activation {
     savedStackNext: number;
 }
 
-function truthy(v: number | bigint): boolean {
-    return typeof v === "bigint" ? v !== 0n : v !== 0 && !Number.isNaN(v);
-}
-
-function scalarKind(t: CType): ScalarKind {
-    switch (t.kind) {
-        case "bool":
-            return "u8";
-        case "enum":
-            return "i32";
-        case "pointer":
-            return "u64";
-        case "float":
-            return t.bits === 32 ? "f32" : "f64";
-        case "int":
-            return `${t.signed ? "i" : "u"}${t.bits}` as ScalarKind;
-        default:
-            throw new Error(`no scalar kind for ${t.kind}`);
-    }
-}
-
+/**
+ * Abstraction of a virtual machine, to execute instructions
+ * based on the custom instruction set
+ *
+ * An instance is created by supplying it with a list of `IRFunction` to run, and calling `.run()` on the instance
+ */
 export class VM {
     mem = new Memory();
     callStack: Activation[] = [];
@@ -405,9 +392,9 @@ export class VM {
         const v = this.mem.readScalar(addr, scalarKind(t));
         return typeof v === "object" ? "<fault>" : `${v}`;
     }
-}
+} // VM class
 
-// ── trace formatting ──
+// ======================== Helpers =============================
 function typeName(t: CType): string {
     switch (t.kind) {
         case "void":
@@ -480,5 +467,26 @@ function describeInstr(i: Instr): string {
             return `RET ${i.hasValue ? "value" : "void"}`;
         case "POP":
             return "POP";
+    }
+}
+
+function truthy(v: number | bigint): boolean {
+    return typeof v === "bigint" ? v !== 0n : v !== 0 && !Number.isNaN(v);
+}
+
+function scalarKind(t: CType): ScalarKind {
+    switch (t.kind) {
+        case "bool":
+            return "u8";
+        case "enum":
+            return "i32";
+        case "pointer":
+            return "u64";
+        case "float":
+            return t.bits === 32 ? "f32" : "f64";
+        case "int":
+            return `${t.signed ? "i" : "u"}${t.bits}` as ScalarKind;
+        default:
+            throw new Error(`no scalar kind for ${t.kind}`);
     }
 }

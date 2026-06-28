@@ -191,19 +191,32 @@ class FunctionCompiler {
         return fc;
     }
 
+    /**
+     * Compiles a `function_definition` node.
+     *
+     * Function declarations are handled separately and should not call this,
+     * as it expects the node to have a function body.
+     *
+     * @returns An `IRFunction`
+     */
     compile(): IRFunction {
         if (!this.fn)
             throw new Error("compile() on a synthetic compiler; use finish()");
-        const base = baseType(this.fn.childForFieldName("type")!, this.ctx);
-        const fnDecl = this.fn.childForFieldName("declarator")!;
-        if (fnDecl.type != "function_declarator")
+
+        const returnType = baseType(
+            this.fn.childForFieldName("type")!,
+            this.ctx
+        );
+        const decl = this.fn.childForFieldName("declarator")!;
+
+        if (decl.type != "function_declarator")
             throw new CompileError("not a function declarator", this.fn);
-        const name = declaratorName(fnDecl.childForFieldName("declarator")!);
+
+        const name = declaratorName(decl.childForFieldName("declarator")!);
         const { params: rawParams, variadic } = this.extractParams(
-            fnDecl.childForFieldName("parameters")!
+            decl.childForFieldName("parameters")!
         );
         const params = this.layoutParams(rawParams); // leading frame slots; seeds the cursor
-        const returnType = base;
         const body = this.fn.childForFieldName("body")!;
         this.compileBlockItems(body);
         this.ensureTrailingRet(body);
@@ -217,6 +230,11 @@ class FunctionCompiler {
         };
     }
 
+    /**
+     * Attaches an offset to each parameter and sets `frameSize` and `frameCursor` to the total stack space
+     * @param raw List of parameters
+     * @returns List of parameters with their computed offset from the base pointer of the function
+     */
     private layoutParams(
         raw: { name: string; type: CType }[]
     ): { name: string; type: CType; offset: number }[] {
@@ -233,6 +251,10 @@ class FunctionCompiler {
         return out;
     }
 
+    /**
+     * Ensures that a function always has a return value (defaults to `void` if none)
+     * @param node A `return_statement` node
+     */
     private ensureTrailingRet(node: SyntaxNode): void {
         const last = this.code[this.code.length - 1];
         if (!last || last.op !== "RET")
@@ -256,6 +278,10 @@ class FunctionCompiler {
         };
     }
 
+    /**
+     * Compiles a declaration statement and pushes an instruction onto the instruction list
+     * @param node A `declaration` node
+     */
     private compileDeclaration(node: SyntaxNode): void {
         this.emitDeclaration(node, this.declarationStorage(node), false);
     }
@@ -266,22 +292,33 @@ class FunctionCompiler {
         this.emitDeclaration(node, "static", true);
     }
 
+    /**
+     *
+     * @param node A `declaration` node
+     * @param storage Storage duration (static/automatic)
+     * @param skipFunctionDecls Whether or not to skip function declarations
+     */
     private emitDeclaration(
         node: SyntaxNode,
         storage: "static" | "automatic",
         skipFunctionDecls: boolean
     ): void {
         const base = baseType(node.childForFieldName("type")!, this.ctx);
+
+        // May have multiple declarators
         for (const d of node.childrenForFieldName("declarator")) {
             const inner =
                 d.type === "init_declarator"
                     ? d.childForFieldName("declarator")!
                     : d;
             const ctype = applyDeclaratorType(base, inner);
+
             if (skipFunctionDecls && ctype.kind === "function") continue;
             const name = declaratorName(inner);
 
             let offset = 0;
+
+            // Update frameCursor and frameSize if stack-based
             if (storage === "automatic") {
                 const a = alignOf(ctype);
                 this.frameCursor = roundUp(this.frameCursor, a);
@@ -290,8 +327,11 @@ class FunctionCompiler {
                 if (this.frameCursor > this.frameSize)
                     this.frameSize = this.frameCursor;
             }
+
+            // Allocate stack space (if automatic storage duration)
             this.emit({ op: "ALLOC", name, ctype, storage, offset }, d);
 
+            // Load variable -> evaluate expression -> store expression value into variable -> pop expression value
             if (d.type === "init_declarator") {
                 const value = d.childForFieldName("value")!;
                 if (value.type === "initializer_list")
@@ -307,6 +347,12 @@ class FunctionCompiler {
         }
     }
 
+    /**
+     * Pushes an operation into the instruction list
+     * @param op An `Op` from the custom instruction set
+     * @param node The node that produces this instruction
+     * @returns The index of the instruction in the instruction list
+     */
     private emit(op: Op, node: SyntaxNode): number {
         this.code.push({ ...op, node } as Instr);
         return this.code.length - 1;
@@ -324,6 +370,10 @@ class FunctionCompiler {
             i.target = target;
     }
 
+    /**
+     * Extracts parameters from a parameter list.
+     * @param list A `parameter_list` node
+     */
     private extractParams(list: SyntaxNode): {
         params: { name: string; type: CType }[];
         variadic: boolean;
@@ -405,7 +455,10 @@ class FunctionCompiler {
         return { params, variadic };
     }
 
-    // statements
+    /**
+     * Compiles a block of code e.g. `{ ... }`, function bodies into instructions and pushes the instructions on to the instruction list
+     * @param block A `compound_statement` node
+     */
     private compileBlockItems(block: SyntaxNode): void {
         for (const item of block.namedChildren) {
             if (item.type === "comment") continue;
@@ -413,6 +466,9 @@ class FunctionCompiler {
         }
     }
 
+    /**
+     * Compiles a single statement e.g. declarations, initialization, expressions, control flow
+     */
     private compileStatement(node: SyntaxNode): void {
         switch (node.type) {
             case "comment":
@@ -451,6 +507,10 @@ class FunctionCompiler {
         }
     }
 
+    /**
+     * @param node A `declaration` node
+     * @returns The storage duration of a declaration (defaults to `automatic` if `static` or `extern` are not stated)
+     */
     private declarationStorage(node: SyntaxNode): "static" | "automatic" {
         for (const c of node.children)
             if (
@@ -1091,6 +1151,12 @@ function evalConstInt(node: SyntaxNode): number {
     }
 }
 
+/**
+ *
+ * @param spec A `SyntaxNode`
+ * @param ctx Context to use to search for non-primitive user-defined types (structs, enums) to detect naming conflicts or redeclarations
+ * @returns The base type (`CType`) of a node
+ */
 function baseType(spec: SyntaxNode, ctx: ModuleCtx): CType {
     switch (spec.type) {
         case "primitive_type":
@@ -1106,6 +1172,7 @@ function baseType(spec: SyntaxNode, ctx: ModuleCtx): CType {
                 );
             return t;
         }
+        // TODO:
         case "struct_specifier":
         case "union_specifier":
             return resolveAggregate(spec, ctx);
