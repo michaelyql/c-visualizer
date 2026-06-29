@@ -16,7 +16,8 @@ const INT32: CType = { kind: "int", bits: 32, signed: true };
 const align = (n: number, a: number) => Math.ceil(n / a) * a;
 
 interface Scope {
-    bindings: Map<string, number>; // name -> address
+    bindings: Map<string, number>; // name -> address (local variables)
+    statics: Map<string, number>; // local static variables
 }
 /**
  * An activation frame i.e. "stack frame"
@@ -40,7 +41,7 @@ export class VM {
     callStack: Activation[] = [];
     valueStack: RtValue[] = [];
     objects = new Map<number, MemObject>();
-    globals: Scope = { bindings: new Map() };
+    globals: Scope = { bindings: new Map(), statics: new Map() };
 
     staticNext = VADDR.STATIC_BASE as number;
     heapNext = VADDR.HEAP_BASE;
@@ -50,8 +51,7 @@ export class VM {
     status: Status = { kind: "running" };
 
     // Map from function name to IRFunction
-    // TODO:
-    // Technically should be from function signature (name+params) to allow function overloading
+    // C does not support function overloading
     private byName: Map<string, IRFunction>;
     private traceEnabled = false;
 
@@ -62,6 +62,7 @@ export class VM {
     run(trace = false): Status {
         this.traceEnabled = trace;
         this.status = { kind: "running" } as Status;
+
         const init = this.byName.get("@init");
         if (init) {
             this.enter(init);
@@ -87,7 +88,7 @@ export class VM {
 
             if (this.traceEnabled)
                 console.log(
-                    `fn=${f.fn.name},pc=${pc},bp=${f.frameBase.toString(16)}  ${describeInstr(instr)}`
+                    `fn=${f.fn.name},pc=${pc},bp=0x${f.frameBase.toString(16)}  ${describeInstr(instr)}`
                 );
 
             this.exec(instr);
@@ -96,6 +97,11 @@ export class VM {
                 console.log(
                     `    stack [${this.valueStack.map(fmtVal).join(", ")}]  depth ${this.callStack.length}`
                 );
+        }
+        if (this.status.kind === "fault") {
+            console.log(
+                `error: ${this.status.reason}, addr=${this.status.addr}`
+            );
         }
     }
 
@@ -115,6 +121,11 @@ export class VM {
         return this.globals.bindings.get(name);
     }
 
+    /**
+     * Updates the `status` of the VM and stops execution
+     * @param reason
+     * @param addr
+     */
     private fault(reason: string, addr?: number): void {
         this.status = { kind: "fault", reason, addr };
     }
@@ -140,7 +151,7 @@ export class VM {
         const act: Activation = {
             fn,
             pc: 0,
-            scopes: [{ bindings: new Map() }],
+            scopes: [{ bindings: new Map(), statics: new Map() }],
             frameBase,
         };
         this.callStack.push(act);
@@ -174,7 +185,10 @@ export class VM {
                 this.valueStack.pop();
                 return;
             case "ENTER_SCOPE":
-                this.top().scopes.push({ bindings: new Map() });
+                this.top().scopes.push({
+                    bindings: new Map(),
+                    statics: new Map(),
+                });
                 return;
             case "EXIT_SCOPE":
                 this.top().scopes.pop();
@@ -196,6 +210,13 @@ export class VM {
             case "ALLOC": {
                 const size = sizeOf(instr.ctype);
                 if (instr.storage === "static") {
+                    // TODO:
+                    // if static variable is declined inside a function, should have name mangling i.e. prepend function name before variable name to distinguish them
+                    // when resolving local variables, if it refers to a static local variable, the static local variable should be hoisted to the function scope level
+
+                    // file level static -> global binding
+                    // function level static -> bind to function scope
+
                     // static memory grows up
                     this.staticNext = align(
                         this.staticNext,
@@ -215,13 +236,27 @@ export class VM {
                     });
                 } else {
                     // stack grows down
-                    const addr =
+                    const addr_ =
                         this.top().frameBase -
                         instr.offset -
                         sizeOf(instr.ctype); // bytes stay uninitialized
-                    this.currentScope().bindings.set(instr.name, addr);
-                    this.objects.set(addr, {
-                        address: addr,
+
+                    // check for redeclaration in the same scope (illegal)
+                    const scope_ = this.currentScope();
+                    if (
+                        scope_.bindings.has(instr.name) ||
+                        scope_.statics.has(instr.name)
+                    ) {
+                        this.fault(
+                            `redeclaration of variable ${instr.name}`,
+                            addr_
+                        );
+                        return;
+                    }
+
+                    scope_.bindings.set(instr.name, addr_);
+                    this.objects.set(addr_, {
+                        address: addr_,
                         type: instr.ctype,
                         name: instr.name,
                         region: "stack",
@@ -356,8 +391,6 @@ export class VM {
                 for (let i = 0; i < n; i++) {
                     const p = callee.params[i];
 
-                    // should this be + offset?
-                    // now offsets are positive values, so maybe this should be -p.offset
                     const addr = act.frameBase - p.offset - sizeOf(p.type);
                     this.storeScalar(
                         addr,
@@ -467,6 +500,9 @@ function typeName(t: CType): string {
     }
 }
 function fmtVal(v: RtValue): string {
+    if (v.type.kind == "pointer") {
+        return `0x${(v.value as number).toString(16)}:${typeName(v.type)}`;
+    }
     return `${v.value as number}:${typeName(v.type)}`;
 }
 function describeInstr(i: Instr): string {
